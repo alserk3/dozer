@@ -1,0 +1,2196 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h> // Вместо EEPROM
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <PubSubClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ArduinoJson.h>
+#include <driver/ledc.h>
+#define PUMP_1 0
+#define PUMP_2 1
+#define PUMP_3 2
+#define PUMP_4 3
+
+//Глобальные переменные
+unsigned long pumpStartTime = 0; // Время начала работы помпы
+unsigned long pumpDuration = 0;  // Длительность работы помпы
+int currentPump = 0;             // Текущая помпа
+
+// Настройки Wi-Fi
+const char* ssid = "Home";
+const char* password = "58YU53tff";
+
+// Настройки MQTT
+const char* mqttServer = "192.168.1.15";
+const int mqttPort = 1883;
+const char* mqttUser = "mqtt";
+const char* mqttPassword = "mqtt";
+const char* mqttClientID = "doser_esp8266";
+
+const int pumpPins[4] = {25, 26, 27, 14}; // Пример для ESP32
+
+// Пины реле
+const int relay1Pin = 16;
+const int relay2Pin = 17;
+const int relay3Pin = 18;
+const int relay4Pin = 19;
+
+// Состояние реле
+bool relay1State = false;
+bool relay2State = false;
+bool relay3State = false;
+bool relay4State = false;
+// ++++++++++++++++++весь код для 12 вольт++++++++++++++++++++++++
+// Пины для 12V линий
+const int line1Pin = 12; // Пример для ESP32
+const int line2Pin = 13;
+const int line3Pin = 14;
+const int line4Pin = 15;
+
+// Каналы ШИМ
+const int line1Channel = 0;
+const int line2Channel = 1;
+const int line3Channel = 2;
+const int line4Channel = 3;
+
+// Частота ШИМ и разрешение
+const int pwmFrequency = 1000; // 1 кГц
+const int pwmResolution = 8;   // 8 бит (0-255)
+
+// Состояние 12V линий
+bool line1State = false;
+bool line2State = false;
+bool line3State = false;
+bool line4State = false;
+
+// Режим управления (PWM или постоянное напряжение)
+bool line1Mode = false; // false = постоянное напряжение, true = PWM
+bool line2Mode = false;
+bool line3Mode = false;
+bool line4Mode = false;
+
+// ШИМ значения (0-255)
+int line1PWM = 0;
+int line2PWM = 0;
+int line3PWM = 0;
+int line4PWM = 0;
+
+// Имена 12V линий
+String lineNames[4] = {"Линия 1", "Линия 2", "Линия 3", "Линия 4"};
+// ---------------------------------------------------------------------
+
+// Объекты
+Preferences preferences;
+
+// Пины для DS18B20
+const int oneWireBus = 4;
+OneWire oneWire(oneWireBus);
+DallasTemperature sensors(&oneWire);
+
+// Калибровочные коэффициенты (мл/сек)
+int calibratingPump = 0;              // 0 = нет калибровки, 1-4 = номер помпы
+unsigned long calibrationStartTime = 0;
+float pumpCalibrations[4] = {1.0, 1.0, 1.0, 1.0}; // мл/сек
+
+// Структура для расписания
+struct Schedule {
+    String time;
+    bool enabled;
+    float pump1Dose;
+    float pump2Dose;
+    float pump3Dose;
+    float pump4Dose;
+};
+
+// Структура для хранения настроек
+struct Settings {
+    float pumpCalibrations[4]; // Массив для 4 помп
+    
+    struct {
+        char time[6]; // Время в формате "HH:MM"
+        bool enabled;
+        float pump1Dose;
+        float pump2Dose;
+        float pump3Dose;
+        float pump4Dose;
+    } schedules[3]; // Массив для хранения расписаний
+};
+
+// Расписание
+Schedule schedules[3] = {
+    {"08:00", true, 1.0, 1.0, 1.0, 1.0},
+    {"12:00", false, 1.0, 1.0, 1.0, 1.0},
+    {"18:00", false, 1.0, 1.0, 1.0, 1.0}
+};
+
+// Логи
+String logMessages = "";
+
+// переменные для хранения имен
+String pumpNames[4] = {"Помпа 1", "Помпа 2", "Помпа 3", "Помпа 4"};
+String relayNames[4] = {"Реле 1", "Реле 2", "Реле 3", "Реле 4"};
+
+// NTP клиент
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 10800, 60000); // GMT+3
+
+// Веб-сервер
+WebServer server(80);
+
+// MQTT клиент
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// Аутентификация
+const char* www_username = "admin";
+const char* www_password = "admin";
+
+// Флаги для управления дозированием
+bool isDispensing = false;
+bool isPumpStoppedAutomatically = false; // Флаг для отслеживания автоматической остановки
+bool isScheduleExecuted[3] = {false, false, false}; // Флаги для каждого расписания
+
+// Прототипы функций
+void handleRoot();
+void handleDispense();
+void handleCalibrate();
+// ручная калибровка
+void handleCalibrationStart();
+void handleCalibrationStop();
+void handleCalibrationSave();
+void saveCalibrationSettings();
+void handleManualCalibration();
+// --------------
+void handleSchedule();
+void handleReset();
+void handleLogs();
+void handleSettings();
+void handleRelayControl();
+void handleRelayStatus();
+void handleTemperature();
+void dispense(float amounts[4]);
+void dispense(float amount1, float amount2, float amount3, float amount4);
+void calibrate();
+void saveSettings();
+void loadSettings();
+void resetSettings();
+void addLog(String message);
+int getCurrentMinutes();
+bool shouldRunSchedule(int scheduleIndex);
+void checkSchedule();
+void reconnectMQTT();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void sendMQTTDiscovery();
+void sendMQTTDiscoverySwitch(const String& pump, const String& name);
+void sendMQTTDiscoverySensor(const String& sensor, const String& name, const String& unit = "");
+void sendWiFiStatusAttributes(); 
+void updateMQTTSensors();
+bool isAuthenticated();
+void connectWiFi();
+void startPump(int pump);
+void stopPump(int pump);
+void handleRename();
+// 12 вольт+++++++++++++
+void handleLineControl();
+void controlLine();
+void handleUpdatePWM();
+void handleUpdateLineMode();
+void handleRenameLine();
+// --------------------
+String getFormattedTime();
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("Инициализация...");
+    // Инициализация пинов
+    pinMode(pumpPins[0], OUTPUT);
+    pinMode(pumpPins[1], OUTPUT);
+    pinMode(pumpPins[2], OUTPUT);
+    pinMode(pumpPins[3], OUTPUT);
+    pinMode(relay1Pin, OUTPUT);
+    pinMode(relay2Pin, OUTPUT);
+    pinMode(relay3Pin, OUTPUT);
+    pinMode(relay4Pin, OUTPUT);
+    digitalWrite(relay1Pin, HIGH); // Реле выключено (активный низкий уровень)
+    digitalWrite(relay2Pin, HIGH);
+    digitalWrite(relay3Pin, HIGH);
+    digitalWrite(relay4Pin, HIGH);
+    
+    // Инициализация пинов для 12V линий
+    pinMode(line1Pin, OUTPUT);
+    pinMode(line2Pin, OUTPUT);
+    pinMode(line3Pin, OUTPUT);
+    pinMode(line4Pin, OUTPUT);
+
+    // Настройка таймера
+    ledc_timer_config_t timer_conf = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT, // 8 бит (0-255)
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 1000, // Частота 1 кГц
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&timer_conf);
+
+    // Настройка каналов для каждой линии
+    ledc_channel_config_t channel1_conf = {
+        .gpio_num = line1Pin,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0, // Начальное значение ШИМ
+        .hpoint = 0
+    };
+    ledc_channel_config(&channel1_conf);
+
+    ledc_channel_config_t channel2_conf = {
+        .gpio_num = line2Pin,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ledc_channel_config(&channel2_conf);
+
+    ledc_channel_config_t channel3_conf = {
+        .gpio_num = line3Pin,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_2,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ledc_channel_config(&channel3_conf);
+
+    ledc_channel_config_t channel4_conf = {
+        .gpio_num = line4Pin,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_3,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ledc_channel_config(&channel4_conf);
+    
+    // Инициализация DS18B20
+    sensors.begin();
+
+    // Инициализация Preferences
+    preferences.begin("doser", false); // "doser" — имя пространства имен
+    loadSettings();
+
+    // Подключение к Wi-Fi
+    connectWiFi();
+
+    // Инициализация NTP клиента
+    timeClient.begin();
+
+    // Настройка MQTT
+    mqttClient.setServer(mqttServer, mqttPort);
+    mqttClient.setCallback(mqttCallback);
+
+   // Настройка веб-сервера
+  server.on("/", HTTP_GET, handleRoot, []() {
+      if (!server.authenticate(www_username, www_password)) {
+            return server.requestAuthentication();
+    }
+    server.send(200, "text/html; charset=utf-8" , "<h1>Добро пожаловать!</h1>");//что бы были русские буквы
+    });
+
+    // Настройка веб-сервера
+    server.on("/dispense", HTTP_GET, handleDispense);
+    server.on("/calibrate", HTTP_GET, handleCalibrate);
+    server.on("/manualCalibration", HTTP_GET, handleManualCalibration);
+    server.on("/schedule", HTTP_GET, handleSchedule);
+    server.on("/reset", HTTP_GET, handleReset);
+    server.on("/logs", HTTP_GET, handleLogs);
+    server.on("/settings", HTTP_GET, handleSettings);
+    server.on("/relay", HTTP_GET, handleRelayControl);
+    server.on("/relayStatus", HTTP_GET, handleRelayStatus);
+    server.on("/rename", HTTP_GET, handleRename);
+    server.on("/temperature", HTTP_GET, handleTemperature);
+    // 12вольт++++++
+    server.on("/updateLineMode", HTTP_GET, handleUpdateLineMode);
+    server.on("/renameLine", HTTP_GET, handleRenameLine);
+    server.on("/lineControl", HTTP_GET, handleLineControl); // Управление 12V линиями
+    // Добавляем маршрут для обновления ШИМ
+    server.on("/updatePWM", HTTP_GET, handleUpdatePWM);
+    // -------------
+    server.on("/restart", HTTP_GET, []() {
+        server.send(200, "application/json", "{\"message\": \"Перезагрузка...\"}");
+        delay(1000);
+        ESP.restart();
+    });
+    server.begin();
+    Serial.println("HTTP сервер запущен");
+    
+    // Отправка MQTT Discovery
+    sendMQTTDiscovery();
+}
+
+void handleRoot() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    String html = R"=====(
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Дозатор</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <style>
+        body { 
+            background-image: url('https://i.imgur.com/7QZQZQZ.png'); 
+            background-size: cover; 
+            background-position: center; 
+            color: white; 
+        }
+        .card { 
+            margin-bottom: 10px; 
+            border: none; 
+            border-radius: 10px; 
+            background-color: rgba(0, 0, 0, 0.7); 
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); 
+            transition: transform 0.2s; 
+        }
+        .card:hover { 
+            transform: translateY(-2px); 
+        }
+        .card-header { 
+            background-color: rgba(13, 110, 253, 0.8); 
+            color: white; 
+            border-radius: 10px 10px 0 0; 
+        }
+        .btn { 
+            margin: 2px; 
+            border-radius: 5px; 
+            background-color: red; /* Временный цвет для проверки */
+            z-index: 1000; /* Убедитесь, что кнопки поверх других элементов */
+            position: relative; /* Для корректного применения z-index */
+        }
+        .log-window { 
+            height: 150px; 
+            overflow-y: auto; 
+            border: 1px solid #ddd; 
+            padding: 10px; 
+            background-color: rgba(255, 255, 255, 0.1); 
+            border-radius: 5px; 
+            font-size: 14px; 
+            color: white; 
+        }
+        .form-control { 
+            border-radius: 5px; 
+            background-color: rgba(255, 255, 255, 0.1); 
+            color: white; 
+            border: 1px solid rgba(255, 255, 255, 0.2); 
+        }
+        .form-control:focus { 
+            background-color: rgba(255, 255, 255, 0.2); 
+            color: white; 
+            border-color: rgba(255, 255, 255, 0.4); 
+        }
+        .toast { 
+            position: fixed; 
+            top: 20px; 
+            right: 20px; 
+            z-index: 1000; 
+        }
+        .btn-relay-on { 
+            background-color: green; 
+        }
+        .btn-relay-off { 
+            background-color: red; 
+        }
+    </style>
+</head>
+<body>
+    <div class="container mt-3">
+        <!-- Toast-уведомления -->
+        <div class="toast" id="toast" role="alert" aria-live="assertive" aria-atomic="true">
+            <div class="toast-body"></div>
+        </div>
+
+        <!-- Дозирование -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title"><i class="fas fa-tint"></i> Дозирование</h5>
+            </div>
+            <div class="card-body">
+                <form id="dispenseForm">
+                    <div class="row g-2">
+                        <div class="col">
+                            <div class="form-control text-center">)=====" + pumpNames[0] + R"=====(</div>
+                            <input type="number" name="pump1" class="form-control" placeholder="Объем (мл)">
+                        </div>
+                        <div class="col">
+                            <div class="form-control text-center">)=====" + pumpNames[1] + R"=====(</div>
+                            <input type="number" name="pump2" class="form-control" placeholder="Объем (мл)">
+                        </div>
+                        <div class="col">
+                            <div class="form-control text-center">)=====" + pumpNames[2] + R"=====(</div>
+                            <input type="number" name="pump3" class="form-control" placeholder="Объем (мл)">
+                        </div>
+                        <div class="col">
+                            <div class="form-control text-center">)=====" + pumpNames[3] + R"=====(</div>
+                            <input type="number" name="pump4" class="form-control" placeholder="Объем (мл)">
+                        </div>
+                        <div class="col-auto">
+                            <button type="submit" class="btn btn-primary mt-4"><i class="fas fa-play"></i> Запуск</button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Таймер калибровки -->
+        <div class="card" id="calibrationTimerCard" style="display: none;">
+            <div class="card-header">
+                <h5 class="card-title"><i class="fas fa-stopwatch"></i> Таймер калибровки</h5>
+            </div>
+            <div class="card-body">
+                <div class="form-control" id="calibrationTimer">00:00</div>
+            </div>
+        </div>
+
+        <!-- Калибровка -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title"><i class="fas fa-wrench"></i> Калибровка</h5>
+            </div>
+            <div class="card-body">
+                <form id="calibrateForm">
+                    <div class="row g-2">
+                        <div class="col">
+                            <input type="number" step="0.01" name="calibration1" class="form-control" placeholder="Помпа 1 (мл/сек)" value=")=====";
+    html += String(pumpCalibrations[0]);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.01" name="calibration2" class="form-control" placeholder="Помпа 2 (мл/сек)" value=")=====";
+    html += String(pumpCalibrations[1]);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.01" name="calibration3" class="form-control" placeholder="Помпа 3 (мл/сек)" value=")=====";
+    html += String(pumpCalibrations[2]);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.01" name="calibration4" class="form-control" placeholder="Помпа 4 (мл/сек)" value=")=====";
+    html += String(pumpCalibrations[3]);
+    html += R"=====(">
+                        </div>
+                        <div class="col-auto">
+                            <button type="submit" class="btn btn-secondary"><i class="fas fa-save"></i> Сохранить коэффициенты</button>
+                        </div>
+                    </div>
+                </form>
+
+                <hr>
+
+                <!-- Ручная калибровка -->
+                <form id="calibrationForm">
+                    <div class="row g-2">
+                        <div class="col">
+                            <select name="pump" class="form-control" required>
+                                <option value="1">Помпа 1</option>
+                                <option value="2">Помпа 2</option>
+                                <option value="3">Помпа 3</option>
+                                <option value="4">Помпа 4</option>
+                            </select>
+                        </div>
+                        <div class="col-auto">
+                            <button type="button" id="calibrationButton" class="btn btn-primary"><i class="fas fa-play"></i> Старт</button>
+                        </div>
+                    </div>
+                    <div class="row g-2 mt-2" id="amountInput" style="display: none;">
+                        <div class="col">
+                            <input type="number" step="0.1" name="amount" class="form-control" placeholder="Объем жидкости (мл)" required>
+                        </div>
+                        <div class="col-auto">
+                            <button type="button" id="saveCalibrationButton" class="btn btn-success"><i class="fas fa-save"></i> Сохранить</button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Расписание -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title"><i class="fas fa-clock"></i> Расписание</h5>
+            </div>
+            <div class="card-body">
+                <form id="scheduleForm">
+                    <!-- Расписание 1 -->
+                    <div class="row g-2">
+                        <div class="col">
+                            <input type="text" name="time0" class="form-control" placeholder="Время (HH:MM)" value=")=====";
+    html += schedules[0].time;
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose1_0" class="form-control" placeholder="Помпа 1 (мл)" value=")=====";
+    html += String(schedules[0].pump1Dose);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose2_0" class="form-control" placeholder="Помпа 2 (мл)" value=")=====";
+    html += String(schedules[0].pump2Dose);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose3_0" class="form-control" placeholder="Помпа 3 (мл)" value=")=====";
+    html += String(schedules[0].pump3Dose);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose4_0" class="form-control" placeholder="Помпа 4 (мл)" value=")=====";
+    html += String(schedules[0].pump4Dose);
+    html += R"=====(">
+                        </div>
+                    </div>
+
+                    <!-- Расписание 2 -->
+                    <div class="row g-2 mt-2">
+                        <div class="col">
+                            <input type="text" name="time1" class="form-control" placeholder="Время (HH:MM)" value=")=====";
+    html += schedules[1].time;
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose1_1" class="form-control" placeholder="Помпа 1 (мл)" value=")=====";
+    html += String(schedules[1].pump1Dose);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose2_1" class="form-control" placeholder="Помпа 2 (мл)" value=")=====";
+    html += String(schedules[1].pump2Dose);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose3_1" class="form-control" placeholder="Помпа 3 (мл)" value=")=====";
+    html += String(schedules[1].pump3Dose);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose4_1" class="form-control" placeholder="Помпа 4 (мл)" value=")=====";
+    html += String(schedules[1].pump4Dose);
+    html += R"=====(">
+                        </div>
+                    </div>
+
+                    <!-- Расписание 3 -->
+                    <div class="row g-2 mt-2">
+                        <div class="col">
+                            <input type="text" name="time2" class="form-control" placeholder="Время (HH:MM)" value=")=====";
+    html += schedules[2].time;
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose1_2" class="form-control" placeholder="Помпа 1 (мл)" value=")=====";
+    html += String(schedules[2].pump1Dose);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose2_2" class="form-control" placeholder="Помпа 2 (мл)" value=")=====";
+    html += String(schedules[2].pump2Dose);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose3_2" class="form-control" placeholder="Помпа 3 (мл)" value=")=====";
+    html += String(schedules[2].pump3Dose);
+    html += R"=====(">
+                        </div>
+                        <div class="col">
+                            <input type="number" step="0.1" name="dose4_2" class="form-control" placeholder="Помпа 4 (мл)" value=")=====";
+    html += String(schedules[2].pump4Dose);
+    html += R"=====(">
+                        </div>
+                    </div>
+
+                    <div class="col-auto mt-2">
+                        <button type="submit" class="btn btn-success"><i class="fas fa-save"></i> Сохранить расписание</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Управление реле -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title"><i class="fas fa-plug"></i> Управление реле</h5>
+            </div>
+            <div class="card-body">
+                <div class="row g-2">
+                    <div class="col">
+                        <div class="form-control text-center">)=====" + relayNames[0] + R"=====(</div>
+                        <button id="relay1" class="btn btn-primary w-100 btn-relay-)=====";
+    html += (relay1State ? "on" : "off");
+    html += R"=====(">)=====";
+    html += (relay1State ? "Вкл" : "Выкл");
+    html += R"=====(</button>
+                    </div>
+                    <div class="col">
+                        <div class="form-control text-center">)=====" + relayNames[1] + R"=====(</div>
+                        <button id="relay2" class="btn btn-primary w-100 btn-relay-)=====";
+    html += (relay2State ? "on" : "off");
+    html += R"=====(">)=====";
+    html += (relay2State ? "Вкл" : "Выкл");
+    html += R"=====(</button>
+                    </div>
+                    <div class="col">
+                        <div class="form-control text-center">)=====" + relayNames[2] + R"=====(</div>
+                        <button id="relay3" class="btn btn-primary w-100 btn-relay-)=====";
+    html += (relay3State ? "on" : "off");
+    html += R"=====(">)=====";
+    html += (relay3State ? "Вкл" : "Выкл");
+    html += R"=====(</button>
+                    </div>
+                    <div class="col">
+                        <div class="form-control text-center">)=====" + relayNames[3] + R"=====(</div>
+                        <button id="relay4" class="btn btn-primary w-100 btn-relay-)=====";
+    html += (relay4State ? "on" : "off");
+    html += R"=====(">)=====";
+    html += (relay4State ? "Вкл" : "Выкл");
+    html += R"=====(</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- Управление 12 вольтовыми линиями -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title"><i class="fas fa-bolt"></i> Управление 12V линиями</h5>
+            </div>
+            <div class="card-body">
+                <div class="row g-2">
+                    <!-- Линия 1 -->
+                    <div class="col">
+                        <div class="form-control text-center">)=====" + lineNames[0] + R"=====(</div>
+                        <select id="line1Mode" class="form-control">
+                            <option value="constant" )=====" + (line1Mode ? "" : "selected") + R"=====(>Постоянное напряжение</option>
+                            <option value="pwm" )=====" + (line1Mode ? "selected" : "") + R"=====(>ШИМ</option>
+                        </select>
+                        <input type="range" id="line1PWM" class="form-range mt-2" min="0" max="255" value=")=====" + String(line1PWM) + R"=====(" style="display: )=====" + (line1Mode ? "block" : "none") + R"=====(;">
+                        <button id="line1Control" class="btn btn-primary w-100 mt-2">)=====" + (line1State ? "Вкл" : "Выкл") + R"=====(</button>
+                    </div>
+                    <!-- Линия 2 -->
+                    <div class="col">
+                    <div class="form-control text-center">)=====" + lineNames[1] + R"=====(</div>
+                        <select id="line2Mode" class="form-control">
+                            <option value="constant">Постоянное напряжение</option>
+                            <option value="pwm">ШИМ</option>
+                        </select>
+                        <input type="range" id="line2PWM" class="form-range" min="0" max="255" value="0" disabled>
+                        <button id="line2Control" class="btn btn-primary w-100">Выкл</button>
+                    </div>
+                    <!-- Линия 3 -->
+                    <div class="col">
+                        <div class="form-control text-center">)=====" + lineNames[2] + R"=====(</div>
+                        <select id="line3Mode" class="form-control">
+                            <option value="constant">Постоянное напряжение</option>
+                            <option value="pwm">ШИМ</option>
+                        </select>
+                        <input type="range" id="line3PWM" class="form-range" min="0" max="255" value="0" disabled>
+                        <button id="line3Control" class="btn btn-primary w-100">Выкл</button>
+                    </div>
+                    <!-- Линия 4 -->
+                    <div class="col">
+                    <div class="form-control text-center">)=====" + lineNames[3] + R"=====(</div>
+                        <select id="line4Mode" class="form-control">
+                            <option value="constant">Постоянное напряжение</option>
+                            <option value="pwm">ШИМ</option>
+                        </select>
+                        <input type="range" id="line4PWM" class="form-range" min="0" max="255" value="0" disabled>
+                        <button id="line4Control" class="btn btn-primary w-100">Выкл</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Сворачиваемый блок: Настройки -->
+        <div class="card">
+            <div class="card-header" data-bs-toggle="collapse" data-bs-target="#collapseSettings" aria-expanded="false" aria-controls="collapseSettings">
+                <h5 class="card-title"><i class="fas fa-cogs"></i> Статус, Настройки, Переименование</h5>
+            </div>
+            <div class="collapse" id="collapseSettings">
+                <div class="card-body">
+                    <!-- Статус -->
+                    <div class="card mb-3">
+                        <div class="card-header">
+                            <h6 class="card-title"><i class="fas fa-info-circle"></i> Статус</h6>
+                        </div>
+                        <div class="card-body">
+                            <div class="row g-2">
+                                <div class="col">
+                                    <div class="form-control">Wi-Fi: )=====";
+    html += (WiFi.status() == WL_CONNECTED ? "Подключено" : "Отключено");
+    html += R"=====(</div>
+                                </div>
+                                <div class="col">
+                                    <div class="form-control">MQTT: )=====";
+    html += (mqttClient.connected() ? "Подключено" : "Отключено");
+    html += R"=====(</div>
+                                </div>
+                                <div class="col">
+                                    <div class="form-control">Время: )=====";
+    html += getFormattedTime();
+    html += R"=====(</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Настройки -->
+                    <div class="card mb-3">
+                        <div class="card-header">
+                            <h6 class="card-title"><i class="fas fa-cog"></i> Настройки</h6>
+                        </div>
+                        <div class="card-body">
+                            <form id="settingsForm">
+                                <div class="row g-2">
+                                    <div class="col">
+                                        <input type="text" name="ip" class="form-control" placeholder="Статический IP" value=")=====";
+    html += WiFi.localIP().toString();
+    html += R"=====(">
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="gateway" class="form-control" placeholder="Шлюз" value=")=====";
+    html += WiFi.gatewayIP().toString();
+    html += R"=====(">
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="subnet" class="form-control" placeholder="Маска подсети" value=")=====";
+    html += WiFi.subnetMask().toString();
+    html += R"=====(">
+                                    </div>
+                                    <div class="col-auto">
+                                        <button type="submit" class="btn btn-info"><i class="fas fa-save"></i> Сохранить</button>
+                                    </div>
+                                </div>
+                            </form>
+                            <hr>
+                            <button id="resetSettings" class="btn btn-danger"><i class="fas fa-undo"></i> Сбросить настройки</button>
+                            <button id="restartDevice" class="btn btn-danger mt-2"><i class="fas fa-power-off"></i> Рестарт</button>
+                        </div>
+                    </div>
+
+                    <!-- Переименование -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h6 class="card-title"><i class="fas fa-edit"></i> Переименование</h6>
+                        </div>
+                        <div class="card-body">
+                            <form id="renameForm">
+                                <!-- Помпы -->
+                                <div class="row g-2">
+                                    <div class="col">
+                                        <input type="text" name="pump1Name" class="form-control" placeholder="Имя помпы 1" value=")=====" + pumpNames[0] + R"=====(" required>
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="pump2Name" class="form-control" placeholder="Имя помпы 2" value=")=====" + pumpNames[1] + R"=====(" required>
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="pump3Name" class="form-control" placeholder="Имя помпы 3" value=")=====" + pumpNames[2] + R"=====(" required>
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="pump4Name" class="form-control" placeholder="Имя помпы 4" value=")=====" + pumpNames[3] + R"=====(" required>
+                                    </div>
+                                </div>
+                                
+                                <!-- Реле -->
+                                <div class="row g-2 mt-2">
+                                    <div class="col">
+                                        <input type="text" name="relay1Name" class="form-control" placeholder="Имя реле 1" value=")=====" + relayNames[0] + R"=====(" required>
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="relay2Name" class="form-control" placeholder="Имя реле 2" value=")=====" + relayNames[1] + R"=====(" required>
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="relay3Name" class="form-control" placeholder="Имя реле 3" value=")=====" + relayNames[2] + R"=====(" required>
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="relay4Name" class="form-control" placeholder="Имя реле 4" value=")=====" + relayNames[3] + R"=====(" required>
+                                    </div>
+                                </div>
+                                
+                                <!-- 12V линии -->
+                                <div class="row g-2 mt-2">
+                                    <div class="col">
+                                        <input type="text" name="line1Name" class="form-control" placeholder="Имя линии 1" value=")=====" + lineNames[0] + R"=====(" required>
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="line2Name" class="form-control" placeholder="Имя линии 2" value=")=====" + lineNames[1] + R"=====(" required>
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="line3Name" class="form-control" placeholder="Имя линии 3" value=")=====" + lineNames[2] + R"=====(" required>
+                                    </div>
+                                    <div class="col">
+                                        <input type="text" name="line4Name" class="form-control" placeholder="Имя линии 4" value=")=====" + lineNames[3] + R"=====(" required>
+                                    </div>
+                                </div>
+                                
+                                <div class="col-auto mt-2">
+                                    <button type="submit" class="btn btn-info"><i class="fas fa-save"></i> Сохранить все имена</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Логи -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title"><i class="fas fa-clipboard-list"></i> Логи</h5>
+            </div>
+            <div class="card-body">
+                <div class="log-window" id="logWindow"></div>
+                <button id="clearLogs" class="btn btn-warning mt-2"><i class="fas fa-trash"></i> Очистить логи</button>
+            </div>
+        </div>
+
+        <!-- Температура -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title"><i class="fas fa-thermometer-half"></i> Температура</h5>
+            </div>
+            <div class="card-body">
+                <div class="form-control" id="temperature">Температура: Загрузка...</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Функция для отображения Toast-уведомлений
+        function showToast(message) {
+            const toast = new bootstrap.Toast(document.getElementById('toast'));
+            document.querySelector('.toast-body').textContent = message;
+            toast.show();
+        }
+
+        // Функция для обновления кнопок реле
+        function updateRelayButton(buttonId, state) {
+            const button = $("#" + buttonId);
+            button.text("Реле " + buttonId.replace("relay", "") + ": " + (state ? "Вкл" : "Выкл"));
+            button.removeClass("btn-relay-on btn-relay-off");
+            button.addClass(state ? "btn-relay-on" : "btn-relay-off");
+        }
+
+        // Обработка формы дозирования
+        $('#dispenseForm').on('submit', function(e) {
+            e.preventDefault(); // Отменяем стандартную отправку формы
+            $.get('/dispense', $(this).serialize(), function(response) {
+                showToast(response.message);
+                updateLogs(); // Обновляем логи
+            }, 'json');
+        });
+
+        // Обработка формы калибровки
+        $('#calibrateForm').on('submit', function(e) {
+            e.preventDefault(); // Отменяем стандартную отправку формы
+            $.get('/calibrate', $(this).serialize(), function(response) {
+                showToast(response.message);
+            }, 'json');
+        });
+
+        // Переменные для таймера
+        let isCalibrating = false;
+        let calibrationStartTime = 0;
+        let timerInterval = null;
+
+        // Функция обновления таймера
+        function updateTimer() {
+            const now = Date.now();
+            const elapsed = now - calibrationStartTime;
+            const minutes = Math.floor((elapsed % 3600000) / 60000).toString().padStart(2, '0');
+            const seconds = Math.floor((elapsed % 60000) / 1000).toString().padStart(2, '0');
+            $('#calibrationTimer').text(`${minutes}:${seconds}`);
+        }
+
+        $('#calibrationButton').on('click', function() {
+            const pump = $('select[name="pump"]').val();
+
+            if (!isCalibrating) {
+                // Запуск калибровки
+                $.get('/manualCalibration', {
+                    action: 'start',
+                    pump: pump
+                }, function(response) {
+                    if (response.status) {
+                        showToast(response.status);
+                        $('#calibrationButton').html('<i class="fas fa-stop"></i> Стоп')
+                            .removeClass('btn-primary')
+                            .addClass('btn-danger');
+                        isCalibrating = true;
+                        $('#amountInput').hide();
+                        $('select[name="pump"]').prop('disabled', true);
+                        calibrationStartTime = Date.now();
+                        $('#calibrationTimerCard').show();
+                        timerInterval = setInterval(updateTimer, 1000);
+                    } else if (response.error) {
+                        showToast("Ошибка: " + response.error);
+                    }
+                }, 'json').fail(function() {
+                    showToast("Ошибка: не удалось подключиться к серверу");
+                });
+            } else {
+                // Остановка калибровки
+                $.get('/manualCalibration', {
+                    action: 'stop',
+                    pump: pump
+                }, function(response) {
+                    if (response.status) {
+                        showToast(response.status);
+                        $('#calibrationButton').html('<i class="fas fa-play"></i> Старт')
+                            .removeClass('btn-danger')
+                            .addClass('btn-primary');
+                        $('#amountInput').show();
+                        isCalibrating = false;
+                        $('select[name="pump"]').prop('disabled', false);
+                        clearInterval(timerInterval);
+                        $('#calibrationTimerCard').hide();
+                        
+                        // Обновляем продолжительность калибровки для сохранения
+                        if (response.duration_ms) {
+                            $('#calibrationDuration').val(response.duration_ms / 1000);
+                        }
+                    } else if (response.error) {
+                        showToast("Ошибка: " + response.error);
+                    }
+                }, 'json').fail(function() {
+                    showToast("Ошибка: не удалось подключиться к серверу");
+                });
+            }
+        });
+
+        $('#saveCalibrationButton').on('click', function() {
+            const pump = $('select[name="pump"]').val();
+            const amount = $('input[name="amount"]').val();
+
+            if (!amount || amount <= 0) {
+                showToast("Ошибка: введите объем жидкости");
+                return;
+            }
+
+            $.get('/manualCalibration', {
+                action: 'save',
+                pump: pump,
+                amount: amount
+            }, function(response) {
+                if (response.status) {
+                    showToast(response.status);
+                    $('#amountInput').hide();
+                    $('input[name="amount"]').val('');
+                    
+                    // Обновляем калибровочный коэффициент на странице
+                    if (response.calibration) {
+                        $('#calibration' + pump).val(response.calibration.toFixed(2));
+                    }
+                } else if (response.error) {
+                    showToast("Ошибка: " + response.error);
+                }
+            }, 'json').fail(function() {
+                showToast("Ошибка: не удалось подключиться к серверу");
+            });
+        });
+
+        // Обработка формы переименования
+        $('#renameForm').on('submit', function(e) {
+            e.preventDefault(); // Отменяем стандартную отправку формы
+            const formData = $(this).serialize();
+            $.get('/rename', formData, function(response) {
+                if (response.message) {
+                    showToast(response.message);
+                    updateNames(); // Обновляем имена на странице
+                } else {
+                    showToast("Ошибка: не удалось сохранить имена");
+                }
+            }, 'json').fail(function() {
+                showToast("Ошибка: не удалось подключиться к серверу");
+            });
+        });
+
+        // Функция для обновления имен помп и реле
+        function updateNames() {
+            const pumpNames = [
+                $('input[name="pump1Name"]').val(),
+                $('input[name="pump2Name"]').val(),
+                $('input[name="pump3Name"]').val(),
+                $('input[name="pump4Name"]').val()
+            ];
+            const relayNames = [
+                $('input[name="relay1Name"]').val(),
+                $('input[name="relay2Name"]').val(),
+                $('input[name="relay3Name"]').val(),
+                $('input[name="relay4Name"]').val()
+            ];
+
+            // Обновляем имена помп
+            for (let i = 1; i <= 4; i++) {
+                $('#pump' + i + 'Name').text(pumpNames[i - 1]);
+            }
+
+            // Обновляем имена реле
+            for (let i = 1; i <= 4; i++) {
+                $('#relay' + i + 'Name').text(relayNames[i - 1]);
+            }
+        }
+
+        // Обновление температуры
+        function updateTemperature() {
+            $.get('/temperature', function(response) {
+                $('#temperature').text("Температура: " + response + " °C");
+            });
+        }
+
+        // Обновляем температуру каждые 60 секунд
+        setInterval(updateTemperature, 60000);
+
+        // Первоначальное обновление температуры
+        updateTemperature();
+
+        // Обработка формы расписания
+        $('#scheduleForm').on('submit', function(e) {
+            e.preventDefault(); // Отменяем стандартную отправку формы
+            $.get('/schedule', $(this).serialize(), function(response) {
+                showToast(response.message);
+            }, 'json');
+        });
+
+        // Очистка логов
+        $('#clearLogs').on('click', function() {
+            $.get('/logs?clear=true', function(response) {
+                showToast(response.message);
+                updateLogs(); // Обновляем логи
+            }, 'json');
+        });
+
+        // Сброс настроек
+        $('#resetSettings').on('click', function() {
+            if (confirm("Вы уверены, что хотите сбросить настройки до заводских?")) {
+                $.get('/reset', function(response) {
+                    showToast(response.message);
+                    setTimeout(function() {
+                        location.reload();
+                    }, 2000);
+                }, 'json');
+            }
+        });
+
+        // Рестарт устройства
+        $('#restartDevice').on('click', function() {
+            if (confirm("Вы уверены, что хотите перезагрузить устройство?")) {
+                $.get('/restart', function(response) {
+                    showToast(response.message);
+                    setTimeout(function() {
+                        location.reload();
+                    }, 2000);
+                }, 'json');
+            }
+        });
+
+        // Управление реле
+        $('[id^="relay"]').on('click', function() {
+            const button = $(this);
+            const relay = button.attr('id').replace('relay', '');
+            const state = button.text().includes('Вкл') ? 'off' : 'on'; // Определяем новое состояние
+
+            // Отправляем запрос на сервер
+            $.get('/relay', { relay: relay, state: state }, function(response) {
+                // Обновляем кнопку на основе ответа сервера
+                const newState = response.message.includes("включено"); // Проверяем ответ
+                updateRelayButton("relay" + relay, newState);
+            }, 'json');
+        });
+
+        // Обновление логов
+        function updateLogs() {
+            $.get('/logs', function(response) {
+                $('#logWindow').html(response); // Обновляем содержимое лог-окна
+                $('#logWindow').scrollTop($('#logWindow')[0].scrollHeight); // Прокручиваем вниз
+            });
+        }
+    </script> 
+    <!-- Новый скрипт для 12V линий -->
+    <script>
+
+        // ++++++++++++++++++++++++++код 12 вольтовых линий++++++++++++++++++++
+        // Управление 12V линиями
+        $(document).ready(function() {
+            // Обработчик изменения режима
+            $('[id^="line"][id$="Mode"]').on('change', function() {
+                const lineNum = $(this).attr('id').replace('line', '').replace('Mode', '');
+                const mode = $(this).val();
+                const pwmSlider = $('#line' + lineNum + 'PWM');
+                
+                // Показываем/скрываем ползунок ШИМ
+                if (mode === 'pwm') {
+                    pwmSlider.show();
+                } else {
+                    pwmSlider.hide();
+                }
+                
+                // Отправляем изменение на сервер
+                updateLineMode(lineNum, mode);
+            });
+
+            // Обработчик кнопок включения/выключения
+            $('[id^="line"][id$="Control"]').on('click', function() {
+                const lineNum = $(this).attr('id').replace('line', '').replace('Control', '');
+                const mode = $('#line' + lineNum + 'Mode').val();
+                const pwmValue = $('#line' + lineNum + 'PWM').val();
+                const newState = $(this).text().includes('Выкл') ? 'on' : 'off';
+                
+                controlLine(lineNum, newState, mode, pwmValue);
+            });
+
+            // Обработчик изменения ШИМ
+            $('[id^="line"][id$="PWM"]').on('input', function() {
+                const lineNum = $(this).attr('id').replace('line', '').replace('PWM', '');
+                const pwmValue = $(this).val();
+                updateLinePWM(lineNum, pwmValue);
+            });
+        });
+
+        // Функция управления линией
+        function controlLine(line, state, mode, pwm) {
+            $.ajax({
+                url: '/lineControl',
+                type: 'GET',
+                data: {
+                    line: line,
+                    state: state,
+                    mode: mode,
+                    pwm: pwm
+                },
+                success: function(response) {
+                    if (response.message) {
+                        const button = $('#line' + line + 'Control');
+                        button.text(response.message.includes("включена") ? "Вкл" : "Выкл");
+                        button.toggleClass('btn-primary btn-success', response.message.includes("включена"));
+                    }
+                },
+                error: function(xhr) {
+                    showToast("Ошибка: " + xhr.responseText);
+                }
+            });
+        }
+
+        // Функция обновления режима
+        function updateLineMode(line, mode) {
+            $.get('/updateLineMode', { line: line, mode: mode }, function(response) {
+                if (response.message) {
+                    showToast(response.message);
+                }
+            }, 'json');
+        }
+
+        // Функция обновления ШИМ
+        function updateLinePWM(line, pwm) {
+            $.get('/updatePWM', { line: line, pwm: pwm }, function(response) {
+                if (response.message) {
+                    console.log("ШИМ обновлен:", response.message);
+                }
+            }, 'json');
+        }
+        // ----------------------------------------------------------------------
+
+        // Первоначальная загрузка логов
+        updateLogs();
+        // Первоначальное обновление имен
+        updateNames();
+    </script>
+</body>
+</html>
+)=====";
+
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+// Основной цикл
+void loop() {
+    server.handleClient(); // Обработка запросов
+    timeClient.update();
+    checkSchedule();
+    reconnectMQTT();
+    mqttClient.loop();
+    updateMQTTSensors();
+    delay(100);
+}
+
+// Подключение к Wi-Fi
+void connectWiFi() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("Подключение к Wi-Fi...");
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nОшибка подключения к Wi-Fi. Переход в режим AP.");
+        WiFi.softAP("DoserAP", "1234"); // Создаем точку доступа
+        addLog("Ошибка подключения к Wi-Fi. Режим AP: DoserAP, пароль: 1234");
+    } else {
+        Serial.println("\nПодключено к Wi-Fi");
+        Serial.println(WiFi.localIP());
+        addLog("Подключено к Wi-Fi: " + WiFi.localIP().toString());
+    }
+}
+
+// Дозирование
+void dispense(float amounts[4]) {
+    for (int i = 0; i < 4; i++) {
+        if (amounts[i] > 0) {
+            unsigned long duration = amounts[i] / pumpCalibrations[i] * 1000;
+            digitalWrite(pumpPins[i], HIGH);
+            delay(duration);
+            digitalWrite(pumpPins[i], LOW);
+        }
+    }
+}
+bool shouldRunSchedule(int scheduleIndex) {
+    if (scheduleIndex < 0 || scheduleIndex >= 3) return false;
+    
+    // Получаем текущее время в минутах
+    timeClient.update();
+    int currentHours = timeClient.getHours();
+    int currentMinutes = timeClient.getMinutes();
+    int currentTotalMinutes = currentHours * 60 + currentMinutes;
+    
+    // Парсим время из расписания
+    String scheduleTime = schedules[scheduleIndex].time;
+    int scheduleHours = scheduleTime.substring(0, 2).toInt();
+    int scheduleMinutes = scheduleTime.substring(3).toInt();
+    int scheduleTotalMinutes = scheduleHours * 60 + scheduleMinutes;
+    
+    if (scheduleHours < 0 || scheduleHours > 23 || scheduleMinutes < 0 || scheduleMinutes > 59) {
+    return false;
+    }
+    
+    // Проверяем совпадение времени и что расписание активно
+    return schedules[scheduleIndex].enabled && 
+           (currentTotalMinutes == scheduleTotalMinutes) && 
+           !isScheduleExecuted[scheduleIndex];
+}
+// Проверка расписания
+void checkSchedule() {
+    int currentMinutes = getCurrentMinutes();
+    
+    for (int i = 0; i < 3; i++) {
+        if (shouldRunSchedule(i)) {
+            float amounts[4] = {
+                schedules[i].pump1Dose,
+                schedules[i].pump2Dose,
+                schedules[i].pump3Dose,
+                schedules[i].pump4Dose
+            };
+            dispense(amounts);
+            isScheduleExecuted[i] = true;
+            addLog("Выполнено расписание " + String(i+1) + " в " + schedules[i].time);
+        }
+        // Сбрасываем флаг выполнения, если время изменилось
+        else if (currentMinutes != (schedules[i].time.substring(0, 2).toInt() * 60 + 
+                                  schedules[i].time.substring(3).toInt())) {
+            isScheduleExecuted[i] = false;
+        }
+    }
+}
+
+
+// Получение текущего времени в минутах
+int getCurrentMinutes() {
+    timeClient.update();
+    return timeClient.getHours() * 60 + timeClient.getMinutes();
+}
+
+// Управление реле через веб-интерфейс
+void handleRelayControl() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (server.hasArg("relay") && server.hasArg("state")) {
+        int relay = server.arg("relay").toInt();
+        String stateArg = server.arg("state");
+        bool state = (stateArg == "on");
+
+        switch (relay) {
+            case 1:
+                digitalWrite(relay1Pin, state ? LOW : HIGH);// LOW включает, HIGH выключает
+                relay1State = state;
+                break;
+            case 2:
+                digitalWrite(relay2Pin, state ? LOW : HIGH);
+                relay2State = state;
+                break;
+            case 3:
+                digitalWrite(relay3Pin, state ? LOW : HIGH);
+                relay3State = state;
+                break;
+            case 4:
+                digitalWrite(relay4Pin, state ? LOW : HIGH);
+                relay4State = state;
+                break;
+            default:
+                server.send(400, "application/json", "{\"message\": \"Ошибка: неверный номер реле\"}");
+                return;
+        }
+
+        String jsonResponse = "{\"message\": \"Реле " + String(relay) + " " + (state ? "включено" : "выключено") + "\"}";
+        server.send(200, "application/json", jsonResponse);
+    } else {
+        server.send(400, "application/json", "{\"message\": \"Ошибка: неверные параметры\"}");
+    }
+}
+
+// Обработчик для получения статуса реле
+void handleRelayStatus() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    String jsonResponse = "{";
+    jsonResponse += "\"relay1\": " + String(relay1State ? "true" : "false") + ",";
+    jsonResponse += "\"relay2\": " + String(relay2State ? "true" : "false") + ",";
+    jsonResponse += "\"relay3\": " + String(relay3State ? "true" : "false") + ",";
+    jsonResponse += "\"relay4\": " + String(relay4State ? "true" : "false");
+    jsonResponse += "}";
+
+    server.send(200, "application/json", jsonResponse);
+}
+
+// Получение температуры с DS18B20
+float getTemperature() {
+    // Проверяем, подключен ли датчик
+    if (sensors.getDeviceCount() == 0) {
+        Serial.println("Ошибка: датчик температуры не найден");
+        addLog("Ошибка: датчик температуры не найден");
+        return -127.0; // Возвращаем значение, указывающее на ошибку
+    }
+
+    // Запрашиваем температуру
+    sensors.requestTemperatures();
+    float temperature = sensors.getTempCByIndex(0);
+
+    // Проверяем, корректно ли получено значение температуры
+    if (temperature == DEVICE_DISCONNECTED_C) {
+        Serial.println("Ошибка: не удалось получить данные с датчика температуры");
+        addLog("Ошибка: не удалось получить данные с датчика температуры");
+        return -127.0; // Возвращаем значение, указывающее на ошибку
+    }
+
+    // Возвращаем температуру
+    return temperature;
+}
+
+void handleRename() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (server.hasArg("pump1Name") && server.hasArg("pump2Name") && server.hasArg("pump3Name") && server.hasArg("pump4Name") &&
+        server.hasArg("relay1Name") && server.hasArg("relay2Name") && server.hasArg("relay3Name") && server.hasArg("relay4Name")) {
+
+        // Сохраняем имена в переменных
+        pumpNames[0] = server.arg("pump1Name");
+        pumpNames[1] = server.arg("pump2Name");
+        pumpNames[2] = server.arg("pump3Name");
+        pumpNames[3] = server.arg("pump4Name");
+        relayNames[0] = server.arg("relay1Name");
+        relayNames[1] = server.arg("relay2Name");
+        relayNames[2] = server.arg("relay3Name");
+        relayNames[3] = server.arg("relay4Name");
+
+        String jsonResponse = "{\"message\": \"Имена сохранены\"}";
+        server.send(200, "application/json", jsonResponse);
+    } else {
+        server.send(400, "application/json", "{\"message\": \"Ошибка: неверные параметры\"}");
+    }
+}
+
+// Отправка MQTT Discovery для переключателей
+void sendMQTTDiscoverySwitch(const String& pump, const String& name) {
+    String configTopic = "homeassistant/switch/doser_" + pump + "/config";
+    String payload = R"=====(
+{
+    "name": ")" + name + R"=====(",
+    "command_topic": "doser/)" + pump + R"=====(/control",
+    "state_topic": "doser/)" + pump + R"=====(/state",
+    "unique_id": "doser_)" + pump + R"=====(",
+    "device": {
+        "identifiers": ["doser_esp8266"],
+        "name": "Дозатор",
+        "manufacturer": "DIY",
+        "model": "ESP8266 Doser"
+    }
+}
+)=====";
+    mqttClient.publish(configTopic.c_str(), payload.c_str(), true);
+}
+
+// Отправка MQTT Discovery для сенсоров
+void sendMQTTDiscoverySensor(const String& sensor, const String& name, const String& unit) {
+    String configTopic = "homeassistant/sensor/doser_" + sensor + "/config";
+    String payload = R"=====(
+{
+    "name": ")" + name + R"=====(",
+    "state_topic": "doser/)" + sensor + R"=====(/state",
+    "unique_id": "doser_)" + sensor + R"=====(",
+    "unit_of_measurement": ")" + unit + R"=====(",
+    "device": {
+        "identifiers": ["doser_esp8266"],
+        "name": "Дозатор",
+        "manufacturer": "DIY",
+        "model": "ESP8266 Doser"
+    }
+}
+)=====";
+    mqttClient.publish(configTopic.c_str(), payload.c_str(), true);
+}
+
+// Отправка MQTT Discovery для всех устройств
+void sendMQTTDiscovery() {
+    // Проверка подключения к MQTT
+    if (!mqttClient.connected()) {
+        Serial.println("Ошибка: MQTT не подключен. Невозможно отправить Discovery.");
+        addLog("Ошибка: MQTT не подключен. Невозможно отправить Discovery.");
+        return;
+    }
+
+    // Массив с данными о помпах
+    const String pumpNames[] = {"Помпа 1", "Помпа 2", "Помпа 3", "Помпа 4"};
+    const String pumpIDs[] = {"pump1", "pump2", "pump3", "pump4"};
+
+    // Отправка конфигурации для каждой помпы
+    for (int i = 0; i < 4; i++) {
+        // Создаем JSON-документ
+        StaticJsonDocument<512> jsonDoc;
+
+        // Заполняем JSON
+        jsonDoc["name"] = pumpNames[i];
+        jsonDoc["command_topic"] = "doser/" + pumpIDs[i] + "/control";
+        jsonDoc["state_topic"] = "doser/" + pumpIDs[i] + "/state";
+        jsonDoc["unique_id"] = "doser_" + pumpIDs[i];
+        jsonDoc["device"]["identifiers"][0] = "doser_esp8266";
+        jsonDoc["device"]["name"] = "Дозатор";
+        jsonDoc["device"]["manufacturer"] = "DIY";
+        jsonDoc["device"]["model"] = "ESP8266 Doser";
+
+        // Сериализуем JSON в строку
+        String payload;
+        serializeJson(jsonDoc, payload);
+
+        // Формируем топик
+        String configTopic = "homeassistant/switch/doser_" + pumpIDs[i] + "/config";
+
+        // Публикуем конфигурацию
+        if (mqttClient.publish(configTopic.c_str(), payload.c_str(), true)) {
+            Serial.println("MQTT Discovery отправлен для " + pumpNames[i]);
+            addLog("MQTT Discovery отправлен для " + pumpNames[i]);
+        } else {
+            Serial.println("Ошибка отправки MQTT Discovery для " + pumpNames[i]);
+            addLog("Ошибка отправки MQTT Discovery для " + pumpNames[i]);
+        }
+    }
+
+    // Массив с данными о сенсорах
+    const String sensorNames[] = {"Логи", "Статус Wi-Fi", "Статус MQTT", "Текущее время"};
+    const String sensorIDs[] = {"logs", "wifi_status", "mqtt_status", "current_time"};
+    const String sensorUnits[] = {"", "", "", ""};
+
+    // Отправка конфигурации для каждого сенсора
+    for (int i = 0; i < 4; i++) {
+        // Создаем JSON-документ
+        StaticJsonDocument<512> jsonDoc;
+
+        // Заполняем JSON
+        jsonDoc["name"] = sensorNames[i];
+        jsonDoc["state_topic"] = "doser/" + sensorIDs[i] + "/state";
+        jsonDoc["json_attributes_topic"] = "doser/" + sensorIDs[i] + "/attributes"; // Добавлен атрибутный топик
+        jsonDoc["unique_id"] = "doser_" + sensorIDs[i];
+        jsonDoc["unit_of_measurement"] = sensorUnits[i];
+        jsonDoc["device"]["identifiers"][0] = "doser_esp8266";
+        jsonDoc["device"]["name"] = "Дозатор";
+        jsonDoc["device"]["manufacturer"] = "DIY";
+        jsonDoc["device"]["model"] = "ESP8266 Doser";
+
+        // Сериализуем JSON в строку
+        String payload;
+        serializeJson(jsonDoc, payload);
+
+        // Формируем топик
+        String configTopic = "homeassistant/sensor/doser_" + sensorIDs[i] + "/config";
+
+        // Публикуем конфигурацию
+        if (mqttClient.publish(configTopic.c_str(), payload.c_str(), true)) {
+            Serial.println("MQTT Discovery отправлен для " + sensorNames[i]);
+            addLog("MQTT Discovery отправлен для " + sensorNames[i]);
+        } else {
+            Serial.println("Ошибка отправки MQTT Discovery для " + sensorNames[i]);
+            addLog("Ошибка отправки MQTT Discovery для " + sensorNames[i]);
+        }
+    }
+
+    // Отправка атрибутов для статуса Wi-Fi
+    sendWiFiStatusAttributes();
+}
+// Обновление состояния сенсоров
+void updateMQTTSensors() {
+    static unsigned long lastUpdate = 0;
+    const unsigned long updateInterval = 10000; // Обновление каждые 10 секунд
+
+    if (millis() - lastUpdate >= updateInterval) {
+        lastUpdate = millis();
+
+        // Отправка логов
+        mqttClient.publish("doser/logs/state", logMessages.c_str(), true);
+
+        // Отправка статуса Wi-Fi
+        String wifiStatus = (WiFi.status() == WL_CONNECTED) ? "Connected" : "Disconnected";
+        mqttClient.publish("doser/wifi_status/state", wifiStatus.c_str(), true);
+
+        // Отправка статуса MQTT
+        String mqttStatus = (mqttClient.connected()) ? "Connected" : "Disconnected";
+        mqttClient.publish("doser/mqtt_status/state", mqttStatus.c_str(), true);
+
+        // Отправка текущего времени
+        String currentTime = getFormattedTime();
+        mqttClient.publish("doser/current_time/state", currentTime.c_str(), true);
+    }
+}
+
+void sendWiFiStatusAttributes() {
+    // Создаем JSON-документ для атрибутов
+    StaticJsonDocument<256> jsonDoc;
+
+    // Заполняем JSON
+    jsonDoc["ip"] = WiFi.localIP().toString();
+    jsonDoc["ssid"] = WiFi.SSID();
+    jsonDoc["rssi"] = WiFi.RSSI();
+
+    // Сериализуем JSON в строку
+    String payload;
+    serializeJson(jsonDoc, payload);
+
+    // Публикуем атрибуты
+    String attributesTopic = "doser/wifi_status/attributes";
+    if (mqttClient.publish(attributesTopic.c_str(), payload.c_str(), true)) {
+        Serial.println("Атрибуты отправлены для Статус Wi-Fi");
+        addLog("Атрибуты отправлены для Статус Wi-Fi");
+    } else {
+        Serial.println("Ошибка отправки атрибутов для Статус Wi-Fi");
+        addLog("Ошибка отправки атрибутов для Статус Wi-Fi");
+    }
+}
+
+// Обработка входящих MQTT сообщений
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    String message;
+    for (int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+
+    Serial.println("Получено сообщение: " + message + " в топике: " + String(topic));
+
+    // Управление помпами
+    if (String(topic) == "doser/pump1/control") {
+        if (message == "ON") {
+            digitalWrite(pumpPins[0], HIGH);
+            mqttClient.publish("doser/pump1/state", "ON");
+            Serial.println("Помпа 1 включена (MQTT)");
+            addLog("Помпа 1 включена (MQTT)");
+        } else if (message == "OFF") {
+            digitalWrite(pumpPins[0], LOW);
+            mqttClient.publish("doser/pump1/state", "OFF");
+            Serial.println("Помпа 1 выключена (MQTT)");
+            addLog("Помпа 1 выключена (MQTT)");
+        }
+    } else if (String(topic) == "doser/pump2/control") {
+        if (message == "ON") {
+            digitalWrite(pumpPins[1], HIGH);
+            mqttClient.publish("doser/pump2/state", "ON");
+            Serial.println("Помпа 2 включена (MQTT)");
+            addLog("Помпа 2 включена (MQTT)");
+        } else if (message == "OFF") {
+            digitalWrite(pumpPins[1], LOW);
+            mqttClient.publish("doser/pump2/state", "OFF");
+            Serial.println("Помпа 2 выключена (MQTT)");
+            addLog("Помпа 2 выключена (MQTT)");
+        }
+    } else if (String(topic) == "doser/pump3/control") {
+        if (message == "ON") {
+            digitalWrite(pumpPins[2], HIGH);
+            mqttClient.publish("doser/pump3/state", "ON");
+            Serial.println("Помпа 3 включена (MQTT)");
+            addLog("Помпа 3 включена (MQTT)");
+        } else if (message == "OFF") {
+            digitalWrite(pumpPins[2], LOW);
+            mqttClient.publish("doser/pump3/state", "OFF");
+            Serial.println("Помпа 3 выключена (MQTT)");
+            addLog("Помпа 3 выключена (MQTT)");
+        }
+    } else if (String(topic) == "doser/pump4/control") {
+        if (message == "ON") {
+            digitalWrite(pumpPins[3], HIGH);
+            mqttClient.publish("doser/pump4/state", "ON");
+            Serial.println("Помпа 4 включена (MQTT)");
+            addLog("Помпа 4 включена (MQTT)");
+        } else if (message == "OFF") {
+            digitalWrite(pumpPins[3], LOW);
+            mqttClient.publish("doser/pump4/state", "OFF");
+            Serial.println("Помпа 4 выключена (MQTT)");
+            addLog("Помпа 4 выключена (MQTT)");
+        }
+    }
+}
+
+// Подключение к MQTT
+void reconnectMQTT() {
+    while (!mqttClient.connected()) {
+        Serial.print("Подключение к MQTT...");
+        if (mqttClient.connect(mqttClientID, mqttUser, mqttPassword)) {
+            Serial.println("подключено");
+
+            // Подписка на топики
+            mqttClient.subscribe("doser/pump1/control");
+            mqttClient.subscribe("doser/pump2/control");
+            mqttClient.subscribe("doser/pump3/control");
+            mqttClient.subscribe("doser/pump4/control");
+
+            sendMQTTDiscovery();
+        } else {
+            Serial.print("ошибка, rc=");
+            Serial.print(mqttClient.state());
+            Serial.println(" повтор через 5 секунд");
+            delay(5000);
+        }
+    }
+}
+
+// Получение текущего времени в формате HH:MM
+String getFormattedTime() {
+    timeClient.update();
+    String hours = String(timeClient.getHours());
+    String minutes = String(timeClient.getMinutes());
+    if (hours.length() == 1) hours = "0" + hours;
+    if (minutes.length() == 1) minutes = "0" + minutes;
+    return hours + ":" + minutes;
+}
+
+// Добавление записи в лог
+void addLog(String message) {
+    String time = getFormattedTime();
+    logMessages += "[" + time + "] " + message + "<br>";
+    if (logMessages.length() > 10000) { // Ограничение размера лога
+        logMessages = logMessages.substring(logMessages.length() - 5000);
+    }
+}
+
+void saveSettings() {
+    preferences.begin("doser", false);
+    
+    // Сохраняем калибровки
+    for(int i = 0; i < 4; i++) {
+        preferences.putFloat(("pumpCalib"+String(i)).c_str(), pumpCalibrations[i]);
+    }
+    
+    // Сохраняем расписания
+    for(int i = 0; i < 3; i++) {
+        String prefix = "sched" + String(i);
+        
+        preferences.putString((prefix + "Time").c_str(), schedules[i].time);
+        preferences.putBool((prefix + "Enabled").c_str(), schedules[i].enabled);
+        preferences.putFloat((prefix + "Pump1").c_str(), schedules[i].pump1Dose);
+        preferences.putFloat((prefix + "Pump2").c_str(), schedules[i].pump2Dose);
+        preferences.putFloat((prefix + "Pump3").c_str(), schedules[i].pump3Dose);
+        preferences.putFloat((prefix + "Pump4").c_str(), schedules[i].pump4Dose);
+    }
+    
+    preferences.end();
+}
+
+void loadSettings() {
+    preferences.begin("doser", true);
+    
+    // Загружаем калибровки
+    for(int i = 0; i < 4; i++) {
+        pumpCalibrations[i] = preferences.getFloat(("pumpCalib"+String(i)).c_str(), 1.0);
+    }
+    
+    // Загружаем расписания
+    for(int i = 0; i < 3; i++) {
+        String prefix = "sched" + String(i);
+        
+        schedules[i].time = preferences.getString((prefix + "Time").c_str(), "08:00");
+        schedules[i].enabled = preferences.getBool((prefix + "Enabled").c_str(), false);
+        schedules[i].pump1Dose = preferences.getFloat((prefix + "Pump1").c_str(), 1.0);
+        schedules[i].pump2Dose = preferences.getFloat((prefix + "Pump2").c_str(), 1.0);
+        schedules[i].pump3Dose = preferences.getFloat((prefix + "Pump3").c_str(), 1.0);
+        schedules[i].pump4Dose = preferences.getFloat((prefix + "Pump4").c_str(), 1.0);
+    }
+    
+    preferences.end();
+}
+
+// Сброс настроек до заводских
+void resetSettings() {
+    // Сбрасываем калибровки
+    for(int i = 0; i < 4; i++) {
+        pumpCalibrations[i] = 1.0;
+    }
+    
+    // Сбрасываем расписания
+    Schedule defaultSchedules[3] = {
+        {"08:00", true, 1.0, 1.0, 1.0, 1.0},
+        {"12:00", false, 1.0, 1.0, 1.0, 1.0},
+        {"18:00", false, 1.0, 1.0, 1.0, 1.0}
+    };
+    
+    for(int i = 0; i < 3; i++) {
+        schedules[i] = defaultSchedules[i];
+    }
+    
+    saveSettings();
+}
+// +++++++++++++++++++++++++12 вольт+++++++++++++++++++++++++++++
+// Функция для управления 12V линиями
+void controlLine(int line, bool state, int pwmValue = 0) {
+    switch (line) {
+        case 1:
+            if (line1Mode) {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, pwmValue);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+            } else {
+                digitalWrite(line1Pin, state ? HIGH : LOW);
+            }
+            line1State = state;
+            line1PWM = pwmValue;
+            break;
+        case 2:
+            if (line2Mode) {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, pwmValue);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+            } else {
+                digitalWrite(line2Pin, state ? HIGH : LOW);
+            }
+            line2State = state;
+            line2PWM = pwmValue;
+            break;
+        case 3:
+            if (line3Mode) {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, pwmValue);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
+            } else {
+                digitalWrite(line3Pin, state ? HIGH : LOW);
+            }
+            line3State = state;
+            line3PWM = pwmValue;
+            break;
+        case 4:
+            if (line4Mode) {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, pwmValue);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3);
+            } else {
+                digitalWrite(line4Pin, state ? HIGH : LOW);
+            }
+            line4State = state;
+            line4PWM = pwmValue;
+            break;
+    }
+}
+// Обработка запросов от веб-интерфейса
+void handleUpdateLineMode() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (server.hasArg("line") && server.hasArg("mode")) {
+        int line = server.arg("line").toInt();
+        bool mode = (server.arg("mode") == "pwm");
+
+        switch (line) {
+            case 1: line1Mode = mode; break;
+            case 2: line2Mode = mode; break;
+            case 3: line3Mode = mode; break;
+            case 4: line4Mode = mode; break;
+        }
+
+        server.send(200, "application/json", "{\"message\":\"Режим линии " + String(line) + " изменен\"}");
+    } else {
+        server.send(400, "application/json", "{\"message\":\"Ошибка: неверные параметры\"}");
+    }
+}
+
+void handleLineControl() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (server.hasArg("line") && server.hasArg("state") && server.hasArg("mode") && server.hasArg("pwm")) {
+        int line = server.arg("line").toInt();
+        bool state = (server.arg("state") == "on");
+        bool mode = (server.arg("mode") == "pwm");
+        int pwm = server.arg("pwm").toInt();
+
+        // Обновляем режим
+        switch (line) {
+            case 1: line1Mode = mode; break;
+            case 2: line2Mode = mode; break;
+            case 3: line3Mode = mode; break;
+            case 4: line4Mode = mode; break;
+        }
+
+        // Управляем линией
+        controlLine(line, state, pwm);
+
+        String response = "{\"message\":\"Линия " + String(line) + " ";
+        response += state ? "включена" : "выключена";
+        response += "\"}";
+        server.send(200, "application/json", response);
+    } else {
+        server.send(400, "application/json", "{\"message\":\"Ошибка: неверные параметры\"}");
+    }
+}
+
+// Переименование 12 вольт
+void handleRenameLine() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+    
+    if (server.hasArg("line1Name") && server.hasArg("line2Name") && 
+        server.hasArg("line3Name") && server.hasArg("line4Name")) {
+        lineNames[0] = server.arg("line1Name");
+        lineNames[1] = server.arg("line2Name");
+        lineNames[2] = server.arg("line3Name");
+        lineNames[3] = server.arg("line4Name");
+        
+        server.send(200, "application/json", "{\"message\":\"Имена линий сохранены\"}");
+    } else {
+        server.send(400, "application/json", "{\"error\":\"Не все имена указаны\"}");
+    }
+}
+//  Управление ШИМ
+void handleUpdatePWM() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (server.hasArg("line") && server.hasArg("pwm")) {
+        int line = server.arg("line").toInt();
+        int pwmValue = server.arg("pwm").toInt();
+
+        // Убедимся, что значение ШИМ в допустимом диапазоне
+        if (pwmValue < 0) pwmValue = 0;
+        if (pwmValue > 255) pwmValue = 255;
+
+        // Обновляем значение ШИМ для соответствующей линии
+        switch (line) {
+            case 1:
+                line1PWM = pwmValue;
+                if (line1Mode) {
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, pwmValue);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+                }
+                break;
+            case 2:
+                line2PWM = pwmValue;
+                if (line2Mode) {
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, pwmValue);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+                }
+                break;
+            case 3:
+                line3PWM = pwmValue;
+                if (line3Mode) {
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, pwmValue);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
+                }
+                break;
+            case 4:
+                line4PWM = pwmValue;
+                if (line4Mode) {
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, pwmValue);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3);
+                }
+                break;
+            default:
+                server.send(400, "application/json", "{\"message\": \"Ошибка: неверный номер линии\"}");
+                return;
+        }
+
+        // Отправляем ответ клиенту
+        String jsonResponse = "{\"message\": \"Значение ШИМ для линии " + String(line) + " изменено на " + String(pwmValue) + "\"}";
+        server.send(200, "application/json", jsonResponse);
+    } else {
+        server.send(400, "application/json", "{\"message\": \"Ошибка: неверные параметры\"}");
+    }
+}
+// -------------------------конец 12 вольт----------------------------------------------------
+
+// Обработка запроса температуры
+void handleTemperature() {
+    float temperature = getTemperature();
+     server.send(200, "text/plain", String(temperature));
+}
+// Ставрт стоп помп+++++++++++++++++++++++++++++++++++++
+void startPump(int pump) {
+    if(pump >= 1 && pump <= 4) {
+        digitalWrite(pumpPins[pump-1], HIGH);
+    }
+}
+
+void stopPump(int pump) {
+    if(pump >= 1 && pump <= 4) {
+        digitalWrite(pumpPins[pump-1], LOW);
+    }
+}
+// ----------------------------------------------------
+// Обработка дозирования
+void handleDispense() {
+    if (server.hasArg("pump1") && server.hasArg("pump2") && 
+        server.hasArg("pump3") && server.hasArg("pump4")) {
+        
+        float amounts[4] = {
+            server.arg("pump1").toFloat(),
+            server.arg("pump2").toFloat(),
+            server.arg("pump3").toFloat(),
+            server.arg("pump4").toFloat()
+        };
+        
+        dispense(amounts);
+        server.send(200, "application/json", "{\"message\":\"Дозирование завершено\"}");
+    }
+}
+// Обработка калибровки
+void handleCalibrate() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (server.hasArg("calibration1") && server.hasArg("calibration2") && 
+        server.hasArg("calibration3") && server.hasArg("calibration4")) {
+        pumpCalibrations[0] = server.arg("calibration1").toFloat();
+        pumpCalibrations[1] = server.arg("calibration2").toFloat();
+        pumpCalibrations[2] = server.arg("calibration3").toFloat();
+        pumpCalibrations[3] = server.arg("calibration4").toFloat();
+        
+        saveSettings();
+        String jsonResponse = "{\"message\": \"Калибровка сохранена\"}";
+        server.send(200, "application/json", jsonResponse);
+    } else {
+        server.send(400, "application/json", "{\"message\": \"Ошибка: неверные параметры\"}");
+    }
+}
+
+// ручная калибровка+++++++++++++++++++++++++
+void handleManualCalibration() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (!server.hasArg("action")) {
+        server.send(400, "application/json", "{\"error\":\"Не указано действие (action)\"}");
+        return;
+    }
+
+    String action = server.arg("action");
+    
+    if (action == "start") {
+        // Код для начала калибровки
+        if (!server.hasArg("pump")) {
+            server.send(400, "application/json", "{\"error\":\"Не указан номер помпы\"}");
+            return;
+        }
+
+        int pump = server.arg("pump").toInt();
+        if (pump < 1 || pump > 4) {
+            server.send(400, "application/json", "{\"error\":\"Номер помпы должен быть 1-4\"}");
+            return;
+        }
+
+        calibratingPump = pump;
+        calibrationStartTime = millis();
+        digitalWrite(pumpPins[pump-1], HIGH);
+
+        server.send(200, "application/json", 
+            "{\"status\":\"Калибровка начата\",\"pump\":" + String(pump) + "}");
+            
+    } else if (action == "stop") {
+        // Код для остановки калибровки
+        if (calibratingPump == 0) {
+            server.send(400, "application/json", "{\"error\":\"Нет активной калибровки\"}");
+            return;
+        }
+
+        // Автоматическая остановка калибровки (5 минут таймаут)
+        if (millis() - calibrationStartTime > 300000) {
+            digitalWrite(pumpPins[calibratingPump-1], LOW);
+            addLog("Автоостановка калибровки помпы " + String(calibratingPump));
+            calibratingPump = 0;
+        }
+
+        digitalWrite(pumpPins[calibratingPump-1], LOW);
+        unsigned long duration = millis() - calibrationStartTime;
+        
+        server.send(200, "application/json", 
+            "{\"status\":\"Калибровка остановлена\",\"pump\":" + String(calibratingPump) + 
+            ",\"duration_ms\":" + String(duration) + "}");
+
+        calibratingPump = 0;
+        
+    } else if (action == "save") {
+        // Код для сохранения калибровки
+        if (!server.hasArg("amount") || !server.hasArg("pump")) {
+            server.send(400, "application/json", "{\"error\":\"Не указан объем или номер помпы\"}");
+            return;
+        }
+
+        int pump = server.arg("pump").toInt();
+        float amount = server.arg("amount").toFloat();
+
+        if (amount <= 0) {
+            server.send(400, "application/json", "{\"error\":\"Объем должен быть положительным\"}");
+            return;
+        }
+
+        unsigned long duration = millis() - calibrationStartTime;
+        float calibration = amount / (duration / 1000.0); // мл/сек
+
+        pumpCalibrations[pump-1] = calibration;
+        saveCalibrationSettings();
+
+        server.send(200, "application/json", 
+            "{\"status\":\"Калибровка сохранена\",\"pump\":" + String(pump) +
+            ",\"calibration\":" + String(calibration, 4) + "}");
+            
+    } else {
+        server.send(400, "application/json", "{\"error\":\"Неизвестное действие\"}");
+    }
+}
+// -------------------------------------------------------------------------
+void saveCalibrationSettings() {
+    preferences.begin("pumps", false);
+    for (int i = 0; i < 4; i++) {
+        preferences.putFloat(("pumpCalib"+String(i)).c_str(), pumpCalibrations[i]);
+    }
+    preferences.end();
+    addLog("Калибровочные коэффициенты сохранены");
+}
+// Обработка расписания
+void handleSchedule() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (server.hasArg("time0") && server.hasArg("dose1_0") && server.hasArg("dose2_0") && server.hasArg("dose3_0") && server.hasArg("dose4_0") &&
+        server.hasArg("time1") && server.hasArg("dose1_1") && server.hasArg("dose2_1") && server.hasArg("dose3_1") && server.hasArg("dose4_1") &&
+        server.hasArg("time2") && server.hasArg("dose1_2") && server.hasArg("dose2_2") && server.hasArg("dose3_2") && server.hasArg("dose4_2")) {
+
+        // Расписание 0
+        schedules[0].time = server.arg("time0");
+        schedules[0].pump1Dose = server.arg("dose1_0").toFloat();
+        schedules[0].pump2Dose = server.arg("dose2_0").toFloat();
+        schedules[0].pump3Dose = server.arg("dose3_0").toFloat();
+        schedules[0].pump4Dose = server.arg("dose4_0").toFloat();
+
+        // Расписание 1
+        schedules[1].time = server.arg("time1");
+        schedules[1].pump1Dose = server.arg("dose1_1").toFloat();
+        schedules[1].pump2Dose = server.arg("dose2_1").toFloat();
+        schedules[1].pump3Dose = server.arg("dose3_1").toFloat();
+        schedules[1].pump4Dose = server.arg("dose4_1").toFloat();
+
+        // Расписание 2
+        schedules[2].time = server.arg("time2");
+        schedules[2].pump1Dose = server.arg("dose1_2").toFloat();
+        schedules[2].pump2Dose = server.arg("dose2_2").toFloat();
+        schedules[2].pump3Dose = server.arg("dose3_2").toFloat();
+        schedules[2].pump4Dose = server.arg("dose4_2").toFloat();
+
+        saveSettings();
+
+        String jsonResponse = "{\"message\": \"Расписание сохранено\"}";
+        server.send(200, "application/json", jsonResponse);
+    } else {
+        server.send(400, "application/json", "{\"message\": \"Ошибка: неверные параметры\"}");
+    }
+}
+
+// Обработка сброса настроек
+void handleReset() {
+    // Проверка аутентификации
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    // Логирование перед сбросом
+    addLog("Запрос на сброс настроек до заводских");
+
+    // Сброс настроек
+    resetSettings(); // Вызов функции сброса настроек
+
+    // Логирование успешного сброса
+    addLog("Настройки сброшены до заводских. Перезагрузка устройства...");
+
+    // Отправка ответа клиенту
+    server.send(200, "application/json", "{\"message\": \"Настройки сброшены до заводских. Перезагрузка...\"}");
+
+    // Задержка для отправки ответа клиенту
+    delay(1000);
+
+    // Перезагрузка устройства
+    ESP.restart();
+}
+
+// Обработка запроса логов
+void handleLogs() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (server.hasArg("clear") && server.arg("clear") == "true") {
+        logMessages = "";
+        addLog("Логи очищены");
+    }
+
+    server.send(200, "text/plain", logMessages);
+}
+
+// Обработка настроек сети
+void handleSettings() {
+    if (!server.authenticate(www_username, www_password)) {
+        return server.requestAuthentication();
+    }
+
+    if (server.hasArg("ip") && server.hasArg("gateway") && server.hasArg("subnet")) {
+        IPAddress staticIP, gateway, subnet;
+        staticIP.fromString(server.arg("ip"));
+        gateway.fromString(server.arg("gateway"));
+        subnet.fromString(server.arg("subnet"));
+
+        WiFi.config(staticIP, gateway, subnet);
+
+        addLog("Настройки сети сохранены: IP - " + server.arg("ip") + ", Gateway - " + server.arg("gateway") + ", Subnet - " + server.arg("subnet"));
+
+        String jsonResponse = "{\"message\": \"Настройки сети сохранены\"}";
+        server.send(200, "application/json", jsonResponse);
+    } else {
+        server.send(400, "application/json", "{\"message\": \"Ошибка: неверные параметры сети\"}");
+    }
+}
